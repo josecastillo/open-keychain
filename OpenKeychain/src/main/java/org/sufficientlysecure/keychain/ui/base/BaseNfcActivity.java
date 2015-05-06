@@ -57,9 +57,11 @@ public abstract class BaseNfcActivity extends BaseActivity {
     public static final int REQUEST_CODE_PASSPHRASE = 1;
 
     protected Passphrase mPin;
+    protected Passphrase mAdminPin;
     protected boolean mPw1ValidForMultipleSignatures;
     protected boolean mPw1ValidatedForSignature;
     protected boolean mPw1ValidatedForDecrypt; // Mode 82 does other things; consider renaming?
+    protected boolean mPw3Validated;
     private NfcAdapter mNfcAdapter;
     private IsoDep mIsoDep;
 
@@ -208,6 +210,10 @@ public abstract class BaseNfcActivity extends BaseActivity {
         mPw1ValidForMultipleSignatures = (pwStatusBytes[0] == 1);
         mPw1ValidatedForSignature = false;
         mPw1ValidatedForDecrypt = false;
+        mPw3Validated = false;
+
+        // TODO: Handle non-default Admin PIN
+        mAdminPin = new Passphrase("12345678");
 
         onNfcPerform();
 
@@ -460,13 +466,21 @@ public abstract class BaseNfcActivity extends BaseActivity {
         return Hex.decode(decryptedSessionKey);
     }
 
-    /** Verifies the user's PW1 with the appropriate mode.
+    /** Verifies the user's PW1 or PW3 with the appropriate mode.
      *
-     * @param mode This is 0x81 for signing, 0x82 for everything else
+     * @param mode For PW1, this is 0x81 for signing, 0x82 for everything else.
+     *             For PW3 (Admin PIN), mode is 0x83.
      */
     public void nfcVerifyPIN(int mode) throws IOException {
-        if (mPin != null) {
-            byte[] pin = new String(mPin.getCharArray()).getBytes();
+        if (mPin != null || mode == 0x83) {
+            byte[] pin;
+
+            if (mode == 0x83) {
+                pin = new String(mAdminPin.getCharArray()).getBytes();
+            } else {
+                pin = new String(mPin.getCharArray()).getBytes();
+            }
+
             // SW1/2 0x9000 is the generic "ok" response, which we expect most of the time.
             // See specification, page 51
             String accepted = "9000";
@@ -488,8 +502,129 @@ public abstract class BaseNfcActivity extends BaseActivity {
                 mPw1ValidatedForSignature = true;
             } else if (mode == 0x82) {
                 mPw1ValidatedForDecrypt = true;
+            } else if (mode == 0x83) {
+                mPw3Validated = true;
             }
         }
+    }
+
+    /** Modifies the user's PW1 or PW3. Before sending, the new PIN will be validated for
+     *  conformance to the card's requirements for key length.
+     *
+     * @param pw For PW1, this is 0x81. For PW3 (Admin PIN), mode is 0x83.
+     * @param newPinString The new PW1 or PW3.
+     */
+    public void nfcModifyPIN(int pw, String newPinString) throws IOException {
+        final int MAX_PW1_LENGTH_INDEX = 1;
+        final int MAX_PW3_LENGTH_INDEX = 3;
+
+        byte[] pwStatusBytes = nfcGetPwStatusBytes();
+        byte[] newPin = newPinString.getBytes();
+
+        if (pw == 0x81) {
+            if (newPin.length < 6 || newPin.length > pwStatusBytes[MAX_PW1_LENGTH_INDEX]) {
+                throw new IOException("Invalid PIN length");
+            }
+        } else if (pw == 0x83) {
+            if (newPin.length < 8 || newPin.length > pwStatusBytes[MAX_PW3_LENGTH_INDEX]) {
+                throw new IOException("Invalid PIN length");
+            }
+        } else {
+            throw new IOException("Invalid PW index for modify PIN operation");
+        }
+
+        byte[] pin;
+
+        if (pw == 0x83) {
+            pin = new String(mAdminPin.getCharArray()).getBytes();
+        } else {
+            pin = new String(mPin.getCharArray()).getBytes();
+        }
+
+        // Command APDU for CHANGE REFERENCE DATA command (page 32)
+        String changeReferenceDataApdu = "00" // CLA
+                + "24" // INS
+                + "00" // P1
+                + String.format("%02x", pw) // P2
+                + String.format("%02x", pin.length + newPin.length) // Lc
+                + getHex(pin)
+                + getHex(newPin);
+        if (!nfcCommunicate(changeReferenceDataApdu).equals("9000")) { // Change reference data
+            handlePinError();
+            throw new IOException("Failed to change PIN");
+        }
+    }
+
+    /**
+     * Stores a data object on the card. Automatically validates the proper PIN for the operation.
+     * Supported for all data objects < 255 bytes in length. Only the cardholder certificate
+     * (0x7F21) can exceed this length.
+     *
+     * @param dataObject The data object to be stored.
+     * @param data The data to store in the object
+     */
+    public void nfcPutData(int dataObject, byte[] data) throws IOException {
+        if (data.length > 254) {
+            throw new IOException("Cannot PUT DATA with length > 254");
+        }
+        if (dataObject == 0x0101 || dataObject == 0x0103) {
+            if (!mPw1ValidatedForDecrypt) {
+                nfcVerifyPIN(0x82); // (Verify PW1 for non-signing operations)
+            }
+        } else if (!mPw3Validated) {
+            nfcVerifyPIN(0x83); // (Verify PW3)
+        }
+
+        String putDataApdu = "00" // CLA
+                + "DA" // INS
+                + String.format("%02x", (dataObject & 0xFF00) >> 8) // P1
+                + String.format("%02x", dataObject & 0xFF) // P2
+                + String.format("%02x", data.length) // Lc
+                + getHex(data);
+
+        if (!nfcCommunicate(putDataApdu).equals("9000")) {
+            throw new IOException("Failed to put data for tag " + dataObject);
+        }
+    }
+
+    /**
+     * Generates a key on the card in the given slot. If the slot is 0xB6 (the signature key),
+     * this command also has the effect of resetting the digital signature counter.
+     * NOTE: This does not set the key fingerprint data object! After calling this command, you
+     * must construct a public key packet using the returned public key data objects, compute the
+     * key fingerprint, and store it on the card using the nfcSetFingerprint method.
+     *
+     * @param slot The slot on the card where the key should be generated:
+     *             0xB6: Signature Key
+     *             0xB8: Decipherment Key
+     *             0xA4: Authentication Key
+     * @return the public key data objects, in TLV format. For RSA this will be the public modulus
+     * (0x81) and exponent (0x82). These may come out of order; proper TLV parsing is required.
+     */
+    public byte[] nfcGenerateOnCardKey(int slot) throws IOException {
+        if (slot != 0xB6 && slot != 0xB8 && slot != 0xA4) {
+            throw new IOException("Invalid key slot");
+        }
+
+        if (!mPw3Validated) {
+            nfcVerifyPIN(0x83); // (Verify PW1 with mode 82 for decryption)
+        }
+
+        String generateKeyApdu = "0047800002" + String.format("%02x", slot) + "0000";
+        String getResponseApdu = "00C00000";
+
+        String first = nfcCommunicate(generateKeyApdu);
+        String second = nfcCommunicate(getResponseApdu);
+
+        if (!second.endsWith("9000")) {
+            throw new IOException("On-card key generation failed");
+        }
+
+        String publicKeyData = nfcGetDataField(first) + nfcGetDataField(second);
+
+        Log.d(Constants.TAG, "Public Key Data Objects: " + publicKeyData);
+
+        return Hex.decode(publicKeyData);
     }
 
     /**
