@@ -19,7 +19,9 @@
 package org.sufficientlysecure.keychain.ui.base;
 
 import java.io.IOException;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.security.interfaces.RSAPrivateCrtKey;
 
 import android.app.Activity;
 import android.app.PendingIntent;
@@ -32,9 +34,12 @@ import android.os.Bundle;
 import android.widget.Toast;
 
 import org.spongycastle.bcpg.HashAlgorithmTags;
+import org.spongycastle.util.Arrays;
 import org.spongycastle.util.encoders.Hex;
 import org.sufficientlysecure.keychain.Constants;
 import org.sufficientlysecure.keychain.R;
+import org.sufficientlysecure.keychain.pgp.CanonicalizedSecretKey;
+import org.sufficientlysecure.keychain.pgp.exception.PgpGeneralException;
 import org.sufficientlysecure.keychain.pgp.exception.PgpKeyNotFoundException;
 import org.sufficientlysecure.keychain.provider.CachedPublicKeyRing;
 import org.sufficientlysecure.keychain.provider.KeychainContract.KeyRings;
@@ -54,10 +59,12 @@ import org.sufficientlysecure.keychain.util.Preferences;
 
 public abstract class BaseNfcActivity extends BaseActivity {
 
-    public static final int REQUEST_CODE_PASSPHRASE = 1;
+    public static final int REQUEST_CODE_PIN = 1;
+    public static final int REQUEST_CODE_PASSPHRASE = 2;
 
     protected Passphrase mPin;
     protected Passphrase mAdminPin;
+    protected Passphrase mPassphrase; // For key export
     protected boolean mPw1ValidForMultipleSignatures;
     protected boolean mPw1ValidatedForSignature;
     protected boolean mPw1ValidatedForDecrypt; // Mode 82 does other things; consider renaming?
@@ -129,6 +136,15 @@ public abstract class BaseNfcActivity extends BaseActivity {
         enableNfcForegroundDispatch();
     }
 
+    protected void obtainKeyExportPassphrase(RequiredInputParcel requiredInput) {
+
+        Intent intent = new Intent(this, PassphraseDialogActivity.class);
+        intent.putExtra(PassphraseDialogActivity.EXTRA_REQUIRED_INPUT,
+                RequiredInputParcel.createRequiredPassphrase(requiredInput));
+        startActivityForResult(intent, REQUEST_CODE_PASSPHRASE);
+
+    }
+
     protected void obtainYubiKeyPin(RequiredInputParcel requiredInput) {
 
         Preferences prefs = Preferences.getPreferences(this);
@@ -140,7 +156,7 @@ public abstract class BaseNfcActivity extends BaseActivity {
         Intent intent = new Intent(this, PassphraseDialogActivity.class);
         intent.putExtra(PassphraseDialogActivity.EXTRA_REQUIRED_INPUT,
                 RequiredInputParcel.createRequiredPassphrase(requiredInput));
-        startActivityForResult(intent, REQUEST_CODE_PASSPHRASE);
+        startActivityForResult(intent, REQUEST_CODE_PIN);
 
     }
 
@@ -151,7 +167,7 @@ public abstract class BaseNfcActivity extends BaseActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         switch (requestCode) {
-            case REQUEST_CODE_PASSPHRASE:
+            case REQUEST_CODE_PIN: {
                 if (resultCode != Activity.RESULT_OK) {
                     setResult(resultCode);
                     finish();
@@ -160,6 +176,18 @@ public abstract class BaseNfcActivity extends BaseActivity {
                 CryptoInputParcel input = data.getParcelableExtra(PassphraseDialogActivity.RESULT_CRYPTO_INPUT);
                 mPin = input.getPassphrase();
                 break;
+            }
+
+            case REQUEST_CODE_PASSPHRASE: {
+                if (resultCode != Activity.RESULT_OK) {
+                    setResult(resultCode);
+                    finish();
+                    return;
+                }
+                CryptoInputParcel input = data.getParcelableExtra(PassphraseDialogActivity.RESULT_CRYPTO_INPUT);
+                mPassphrase = input.getPassphrase();
+                break;
+            }
 
             default:
                 super.onActivityResult(requestCode, resultCode, data);
@@ -582,8 +610,12 @@ public abstract class BaseNfcActivity extends BaseActivity {
                 + String.format("%02x", data.length) // Lc
                 + getHex(data);
 
-        if (!nfcCommunicate(putDataApdu).equals("9000")) {
-            throw new IOException("Failed to put data for tag " + dataObject);
+        String response = nfcCommunicate(putDataApdu);
+        if (!response.equals("9000")) {
+            throw new IOException("Failed to put data for tag "
+                    + String.format("%02x", (dataObject & 0xFF00) >> 8)
+                    + String.format("%02x", dataObject & 0xFF)
+                    + ": " + response);
         }
     }
 
@@ -607,7 +639,7 @@ public abstract class BaseNfcActivity extends BaseActivity {
         }
 
         if (!mPw3Validated) {
-            nfcVerifyPIN(0x83); // (Verify PW1 with mode 82 for decryption)
+            nfcVerifyPIN(0x83); // (Verify PW1 with mode 83)
         }
 
         String generateKeyApdu = "0047800002" + String.format("%02x", slot) + "0000";
@@ -625,6 +657,118 @@ public abstract class BaseNfcActivity extends BaseActivity {
         Log.d(Constants.TAG, "Public Key Data Objects: " + publicKeyData);
 
         return Hex.decode(publicKeyData);
+    }
+
+    /**
+     * Puts a key on the card in the given slot.
+     *
+     * @param slot The slot on the card where the key should be stored:
+     *             0xB6: Signature Key
+     *             0xB8: Decipherment Key
+     *             0xA4: Authentication Key
+     */
+    public void nfcPutKey(int slot, CanonicalizedSecretKey secretKey)
+            throws IOException {
+        if (slot != 0xB6 && slot != 0xB8 && slot != 0xA4) {
+            throw new IOException("Invalid key slot");
+        }
+
+        RSAPrivateCrtKey crtSecretKey = null;
+        try {
+            secretKey.unlock(mPassphrase);
+            crtSecretKey = secretKey.getCrtSecretKey();
+        } catch (PgpGeneralException e) {
+            throw new IOException(e.getMessage());
+        }
+
+        // Shouldn't happen; the UI should block the user from getting an incompatible key this far.
+        if (crtSecretKey.getModulus().bitLength() > 2048) {
+            throw new IOException("Key too large to export to smart card.");
+        }
+
+        // Should happen only rarely; all GnuPG keys since 2006 use public exponent 65537.
+        if (!crtSecretKey.getPublicExponent().equals(new BigInteger("65537"))) {
+            throw new IOException("Invalid public exponent for smart card key.");
+        }
+
+        if (!mPw3Validated) {
+            nfcVerifyPIN(0x83); // (Verify PW1 with mode 83)
+        }
+
+        byte[] header= Hex.decode(
+                "4D82" + "03A2"      // Extended header list 4D82, length of 930 bytes. (page 23)
+                + String.format("%02x", slot) + "00" // CRT to indicate targeted key, no length
+                + "7F48" + "15"      // Private key template 0x7F48, length 21 (decimal, 0x15 hex)
+                + "9103"             // Public modulus, length 3
+                + "928180"           // Prime P, length 128
+                + "938180"           // Prime Q, length 128
+                + "948180"           // Coefficient (1/q mod p), length 128
+                + "958180"           // Prime exponent P (d mod (p - 1)), length 128
+                + "968180"           // Prime exponent Q (d mod (1 - 1)), length 128
+                + "97820100"         // Modulus, length 256, last item in private key template
+                + "5F48" + "820383");// DO 5F48; 899 bytes of concatenated key data will follow
+        byte[] dataToSend = new byte[934];
+        byte[] currentKeyObject;
+        int offset = 0;
+
+        System.arraycopy(header, 0, dataToSend, offset, header.length);
+        offset += header.length;
+        currentKeyObject = crtSecretKey.getPublicExponent().toByteArray();
+        System.arraycopy(currentKeyObject, 0, dataToSend, offset, 3);
+        offset += 3;
+        // NOTE: For a 2048-bit key, these lengths are fixed. However, bigint includes a leading 0
+        // in the array to represent sign, so we take care to set the offset to 1 if necessary.
+        currentKeyObject = crtSecretKey.getPrimeP().toByteArray();
+        System.arraycopy(currentKeyObject, currentKeyObject.length - 128, dataToSend, offset, 128);
+        Arrays.fill(currentKeyObject, (byte)0);
+        offset += 128;
+        currentKeyObject = crtSecretKey.getPrimeQ().toByteArray();
+        System.arraycopy(currentKeyObject, currentKeyObject.length - 128, dataToSend, offset, 128);
+        Arrays.fill(currentKeyObject, (byte)0);
+        offset += 128;
+        currentKeyObject = crtSecretKey.getCrtCoefficient().toByteArray();
+        System.arraycopy(currentKeyObject, currentKeyObject.length - 128, dataToSend, offset, 128);
+        Arrays.fill(currentKeyObject, (byte)0);
+        offset += 128;
+        currentKeyObject = crtSecretKey.getPrimeExponentP().toByteArray();
+        System.arraycopy(currentKeyObject, currentKeyObject.length - 128, dataToSend, offset, 128);
+        Arrays.fill(currentKeyObject, (byte)0);
+        offset += 128;
+        currentKeyObject = crtSecretKey.getPrimeExponentQ().toByteArray();
+        System.arraycopy(currentKeyObject, currentKeyObject.length - 128, dataToSend, offset, 128);
+        Arrays.fill(currentKeyObject, (byte)0);
+        offset += 128;
+        currentKeyObject = crtSecretKey.getModulus().toByteArray();
+        System.arraycopy(currentKeyObject, currentKeyObject.length - 256, dataToSend, offset, 256);
+
+        String putKeyCommand = "10DB3FFF";
+        String lastPutKeyCommand = "00DB3FFF";
+
+        // Now we're ready to communicate with the card.
+        offset = 0;
+        String response;
+        while(offset < dataToSend.length) {
+            int dataRemaining = dataToSend.length - offset;
+            if (dataRemaining > 254) {
+                response = nfcCommunicate(
+                        putKeyCommand + "FE" + Hex.toHexString(dataToSend, offset, 254)
+                );
+                offset += 254;
+            } else {
+                int length = dataToSend.length - offset;
+                response = nfcCommunicate(
+                        lastPutKeyCommand + String.format("%02x", length)
+                        + Hex.toHexString(dataToSend, offset, length));
+                offset += length;
+            }
+
+            if (!response.endsWith("9000")) {
+                throw new IOException("Key export to card failed");
+            }
+        }
+
+        // Clear array with secret data before we return.
+        Arrays.fill(dataToSend, (byte) 0);
     }
 
     /**
